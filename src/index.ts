@@ -11,6 +11,22 @@ import {
 } from 'viem';
 import { sepolia } from 'viem/chains';
 import { mnemonicToAccount } from 'viem/accounts';
+import { ethers } from 'ethers';
+import {
+  getCreationBlock,
+  matchHsrToContact,
+} from '@verbeth/sdk';
+import {
+  initVerbeth,
+  savePendingHandshake,
+  getPendingHandshake,
+  deletePendingHandshake,
+  getAllPendingContacts,
+  scanHandshakeEvents,
+  scanHandshakeResponseEvents,
+  scanMessageEvents,
+  type VerbethInstance,
+} from './verbeth.js';
 
 dotenv.config();
 
@@ -118,6 +134,333 @@ async function main() {
   server.get('/health', async () => {
     return { status: 'ok', agent: account.address };
   });
+
+  // ─── Verbeth Messaging ───────────────────────────────────────────────
+  let verbeth: VerbethInstance | null = null;
+  const verbethRpcUrl =
+    process.env.VERBETH_RPC_URL ||
+    process.env.RPC_URL ||
+    'https://rpc.sepolia.org';
+
+  try {
+    verbeth = await initVerbeth(mnemonic, verbethRpcUrl);
+  } catch (error: any) {
+    console.error('Verbeth init failed (messaging disabled):', error.message);
+  }
+
+  // GET /verbeth/status
+  server.get('/verbeth/status', async (_req, reply) => {
+    if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+    const sessions = verbeth.sessionStore.getAll();
+    return {
+      address: verbeth.address,
+      signingPubKey: Buffer.from(
+        verbeth.client.identityKeyPairInstance.signingPublicKey
+      ).toString('hex'),
+      identityPubKey: Buffer.from(
+        verbeth.client.identityKeyPairInstance.publicKey
+      ).toString('hex'),
+      sessionCount: sessions.length,
+    };
+  });
+
+  // GET /verbeth/sessions
+  server.get('/verbeth/sessions', async (_req, reply) => {
+    if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+    const sessions = verbeth.sessionStore.getAll();
+    return sessions.map((s) => ({
+      conversationId: s.conversationId,
+      contactAddress: s.contactAddress,
+      topicEpoch: s.topicEpoch,
+      sendingMsgNumber: s.sendingMsgNumber,
+      receivingMsgNumber: s.receivingMsgNumber,
+      createdAt: s.createdAt,
+    }));
+  });
+
+  // POST /verbeth/handshake — initiate handshake
+  server.post<{ Body: { to: string; message: string } }>(
+    '/verbeth/handshake',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const { to, message } = request.body;
+      if (!to || !message) {
+        return reply.status(400).send({ error: 'Missing "to" or "message"' });
+      }
+      try {
+        const { tx, ephemeralKeyPair, kemKeyPair } =
+          await verbeth.client.sendHandshake(to, message);
+        const receipt = await tx.wait();
+        savePendingHandshake(to, ephemeralKeyPair.secretKey, kemKeyPair.secretKey);
+        return {
+          success: true,
+          txHash: receipt.hash,
+          to,
+          message,
+          note: 'Handshake sent. Waiting for recipient to accept.',
+        };
+      } catch (error: any) {
+        return reply.status(500).send({ error: 'Handshake failed', message: error.message });
+      }
+    }
+  );
+
+  // POST /verbeth/accept — accept an incoming handshake
+  server.post<{ Body: { from: string; fromBlock?: number } }>(
+    '/verbeth/accept',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const { from, fromBlock } = request.body;
+      if (!from) return reply.status(400).send({ error: 'Missing "from" address' });
+
+      try {
+        const startBlock = fromBlock ?? getCreationBlock(verbeth.chainId);
+        const events = await scanHandshakeEvents(
+          verbeth.contract,
+          verbeth.address,
+          startBlock
+        );
+
+        const hsEvent = events.find(
+          (e: any) => e.sender.toLowerCase() === from.toLowerCase()
+        );
+        if (!hsEvent) {
+          return reply
+            .status(404)
+            .send({ error: `No handshake found from ${from}` });
+        }
+
+        const initiatorEphemeralPubKey = ethers.getBytes(hsEvent.ephemeralPubKey);
+        const result = await verbeth.client.acceptHandshake(
+          initiatorEphemeralPubKey,
+          'Accepted'
+        );
+        const receipt = await result.tx.wait();
+
+        const session = verbeth.client.createResponderSession({
+          contactAddress: from,
+          responderEphemeralSecret: result.responderEphemeralSecret,
+          responderEphemeralPublic: result.responderEphemeralPublic,
+          initiatorEphemeralPubKey,
+          salt: result.salt,
+          kemSharedSecret: result.kemSharedSecret,
+        });
+        await verbeth.sessionStore.save(session);
+
+        return {
+          success: true,
+          txHash: receipt.hash,
+          conversationId: session.conversationId,
+          contactAddress: from,
+        };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Accept handshake failed', message: error.message });
+      }
+    }
+  );
+
+  // POST /verbeth/complete — complete handshake as initiator
+  server.post<{ Body: { from: string; fromBlock?: number } }>(
+    '/verbeth/complete',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const { from, fromBlock } = request.body;
+      if (!from) return reply.status(400).send({ error: 'Missing "from" address' });
+
+      const pending = getPendingHandshake(from);
+      if (!pending) {
+        return reply.status(404).send({
+          error: `No pending handshake secrets for ${from}. Did you initiate a handshake first?`,
+        });
+      }
+
+      try {
+        const startBlock = fromBlock ?? getCreationBlock(verbeth.chainId);
+        const hsrEvents = await scanHandshakeResponseEvents(
+          verbeth.contract,
+          startBlock
+        );
+
+        // Match HSR to our pending contact using the SDK matcher
+        const pendingContacts = getAllPendingContacts();
+        let matchedEvent: any = null;
+
+        for (const evt of hsrEvents) {
+          if (evt.responder.toLowerCase() !== from.toLowerCase()) continue;
+
+          const responderEphemeralR = ethers.getBytes(evt.responderEphemeralR);
+          const ciphertextStr =
+            typeof evt.ciphertext === 'string'
+              ? evt.ciphertext
+              : ethers.hexlify(evt.ciphertext);
+
+          const matched = matchHsrToContact(
+            pendingContacts,
+            evt.inResponseTo as `0x${string}`,
+            responderEphemeralR,
+            ciphertextStr
+          );
+          if (matched && matched.toLowerCase() === from.toLowerCase()) {
+            matchedEvent = evt;
+            break;
+          }
+        }
+
+        if (!matchedEvent) {
+          // Fallback: just use the first HSR from that address
+          matchedEvent = hsrEvents.find(
+            (e: any) => e.responder.toLowerCase() === from.toLowerCase()
+          );
+        }
+
+        if (!matchedEvent) {
+          return reply
+            .status(404)
+            .send({ error: `No handshake response found from ${from}` });
+        }
+
+        const responderEphemeralPubKey = ethers.getBytes(
+          matchedEvent.responderEphemeralR
+        );
+
+        const session = verbeth.client.createInitiatorSessionFromHsr({
+          contactAddress: from,
+          myEphemeralSecret: pending.ephemeralSecret,
+          myKemSecret: pending.kemSecret,
+          hsrEvent: {
+            inResponseToTag: matchedEvent.inResponseTo as `0x${string}`,
+            responderEphemeralPubKey,
+            kemCiphertext: ethers.getBytes(matchedEvent.ciphertext),
+          },
+        });
+        await verbeth.sessionStore.save(session);
+        deletePendingHandshake(from);
+
+        return {
+          success: true,
+          conversationId: session.conversationId,
+          contactAddress: from,
+        };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Complete handshake failed', message: error.message });
+      }
+    }
+  );
+
+  // POST /verbeth/send — send encrypted message
+  server.post<{ Body: { to: string; message: string } }>(
+    '/verbeth/send',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const { to, message } = request.body;
+      if (!to || !message) {
+        return reply.status(400).send({ error: 'Missing "to" or "message"' });
+      }
+
+      // Find session by contact address
+      const sessions = verbeth.sessionStore.getAll();
+      const session = sessions.find(
+        (s) => s.contactAddress.toLowerCase() === to.toLowerCase()
+      );
+      if (!session) {
+        return reply.status(404).send({
+          error: `No session with ${to}. Complete a handshake first.`,
+        });
+      }
+
+      try {
+        const result = await verbeth.client.sendMessage(
+          session.conversationId,
+          message
+        );
+        return {
+          success: true,
+          txHash: result.txHash,
+          topic: result.topic,
+          messageNumber: result.messageNumber,
+          conversationId: session.conversationId,
+        };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Send message failed', message: error.message });
+      }
+    }
+  );
+
+  // GET /verbeth/messages — scan and decrypt incoming messages
+  server.get<{ Querystring: { from?: string; fromBlock?: string } }>(
+    '/verbeth/messages',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const { from, fromBlock: fromBlockStr } = request.query;
+      const fromBlock = fromBlockStr ? Number(fromBlockStr) : getCreationBlock(verbeth.chainId);
+
+      try {
+        // Scan for messages on all inbound topics from our sessions
+        const sessions = verbeth.sessionStore.getAll();
+        const relevantSessions = from
+          ? sessions.filter(
+              (s) => s.contactAddress.toLowerCase() === from.toLowerCase()
+            )
+          : sessions;
+
+        const decryptedMessages: any[] = [];
+
+        for (const session of relevantSessions) {
+          // Scan for messages on the current inbound topic
+          const topics = [
+            session.currentTopicInbound,
+            session.nextTopicInbound,
+            session.previousTopicInbound,
+          ].filter(Boolean) as string[];
+
+          for (const topic of topics) {
+            const events = await scanMessageEvents(
+              verbeth.contract,
+              session.contactAddress,
+              topic,
+              fromBlock
+            );
+
+            for (const evt of events) {
+              try {
+                const payload = ethers.getBytes(evt.ciphertext);
+                const decrypted = await verbeth.client.decryptMessage(
+                  evt.topic,
+                  payload,
+                  new Uint8Array(32), // placeholder — real impl needs sender's signing key
+                  false
+                );
+                if (decrypted) {
+                  decryptedMessages.push({
+                    from: evt.sender,
+                    plaintext: decrypted.plaintext,
+                    topic: evt.topic,
+                    timestamp: evt.timestamp,
+                    blockNumber: evt.blockNumber,
+                    txHash: evt.transactionHash,
+                  });
+                }
+              } catch {
+                // Skip messages we can't decrypt
+              }
+            }
+          }
+        }
+
+        return { messages: decryptedMessages, scannedFromBlock: fromBlock };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Message scan failed', message: error.message });
+      }
+    }
+  );
 
   const port = Number(process.env.PORT ?? 8080);
   try {

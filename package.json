@@ -2,6 +2,7 @@
   "name": "demo-brain",
   "version": "1.0.0",
   "description": "EigenX Randomness Beacon TypeScript Application",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -9,7 +10,9 @@
     "dev": "ts-node src/index.ts"
   },
   "dependencies": {
+    "@verbeth/sdk": "^0.1.11",
     "dotenv": "^16.6.1",
+    "ethers": "^6.16.0",
     "fastify": "^5.1.0",
     "viem": "^2.0.0"
   },
