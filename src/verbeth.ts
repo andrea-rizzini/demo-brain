@@ -91,6 +91,22 @@ class InMemoryPendingStore implements PendingStore {
   }
 }
 
+// --- Contact info store (signing + identity keys learned during handshake) ---
+export interface ContactKeys {
+  signingPubKey: Uint8Array;
+  identityPubKey: Uint8Array;
+}
+
+const contactInfo = new Map<string, ContactKeys>();
+
+export function saveContactInfo(address: string, info: ContactKeys) {
+  contactInfo.set(address.toLowerCase(), info);
+}
+
+export function getContactInfo(address: string): ContactKeys | undefined {
+  return contactInfo.get(address.toLowerCase());
+}
+
 // --- Pending handshake secrets (keyed by lowercase recipient address) ---
 export interface PendingHandshake {
   ephemeralSecret: Uint8Array;

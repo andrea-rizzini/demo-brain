@@ -1,3 +1,6 @@
+import { webcrypto } from 'node:crypto';
+if (!globalThis.crypto) (globalThis as any).crypto = webcrypto;
+
 import dotenv from 'dotenv';
 import Fastify from 'fastify';
 import { randomBytes } from 'node:crypto';
@@ -14,14 +17,16 @@ import { mnemonicToAccount } from 'viem/accounts';
 import { ethers } from 'ethers';
 import {
   getCreationBlock,
-  matchHsrToContact,
+  decryptAndExtractHandshakeKeys,
+  decodeUnifiedPubKeys,
 } from '@verbeth/sdk';
 import {
   initVerbeth,
   savePendingHandshake,
   getPendingHandshake,
   deletePendingHandshake,
-  getAllPendingContacts,
+  saveContactInfo,
+  getContactInfo,
   scanHandshakeEvents,
   scanHandshakeResponseEvents,
   scanMessageEvents,
@@ -178,9 +183,9 @@ async function main() {
     }));
   });
 
-  // POST /verbeth/handshake — initiate handshake
+  // POST /verbeth/handshake/initiate — initiate handshake
   server.post<{ Body: { to: string; message: string } }>(
-    '/verbeth/handshake',
+    '/verbeth/handshake/initiate',
     async (request, reply) => {
       if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
       const { to, message } = request.body;
@@ -205,9 +210,40 @@ async function main() {
     }
   );
 
-  // POST /verbeth/accept — accept an incoming handshake
+  // GET /verbeth/handshake/incoming — list pending incoming handshakes
+  server.get<{ Querystring: { fromBlock?: string } }>(
+    '/verbeth/handshake/incoming',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+      const fromBlock = request.query.fromBlock
+        ? Number(request.query.fromBlock)
+        : getCreationBlock(verbeth.chainId);
+
+      try {
+        const events = await scanHandshakeEvents(
+          verbeth.contract,
+          verbeth.address,
+          fromBlock
+        );
+
+        return {
+          handshakes: events.map((e: any) => ({
+            from: e.sender,
+            blockNumber: e.blockNumber,
+            txHash: e.transactionHash,
+          })),
+        };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Scan failed', message: error.message });
+      }
+    }
+  );
+
+  // POST /verbeth/handshake/accept — accept an incoming handshake
   server.post<{ Body: { from: string; fromBlock?: number } }>(
-    '/verbeth/accept',
+    '/verbeth/handshake/accept',
     async (request, reply) => {
       if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
       const { from, fromBlock } = request.body;
@@ -231,6 +267,17 @@ async function main() {
         }
 
         const initiatorEphemeralPubKey = ethers.getBytes(hsEvent.ephemeralPubKey);
+
+        // Extract initiator's signing key from the handshake event's pubKeys field
+        const pubKeysBytes = ethers.getBytes(hsEvent.pubKeys);
+        const decoded = decodeUnifiedPubKeys(pubKeysBytes);
+        if (decoded) {
+          saveContactInfo(from, {
+            signingPubKey: decoded.signingPubKey,
+            identityPubKey: decoded.identityPubKey,
+          });
+        }
+
         const result = await verbeth.client.acceptHandshake(
           initiatorEphemeralPubKey,
           'Accepted'
@@ -261,9 +308,9 @@ async function main() {
     }
   );
 
-  // POST /verbeth/complete — complete handshake as initiator
+  // POST /verbeth/handshake/complete — complete handshake as initiator
   server.post<{ Body: { from: string; fromBlock?: number } }>(
-    '/verbeth/complete',
+    '/verbeth/handshake/complete',
     async (request, reply) => {
       if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
       const { from, fromBlock } = request.body;
@@ -283,56 +330,64 @@ async function main() {
           startBlock
         );
 
-        // Match HSR to our pending contact using the SDK matcher
-        const pendingContacts = getAllPendingContacts();
-        let matchedEvent: any = null;
+        // Find HSR events from the target responder and try to decrypt each
+        const candidateEvents = hsrEvents.filter(
+          (e: any) => e.responder.toLowerCase() === from.toLowerCase()
+        );
 
-        for (const evt of hsrEvents) {
-          if (evt.responder.toLowerCase() !== from.toLowerCase()) continue;
-
-          const responderEphemeralR = ethers.getBytes(evt.responderEphemeralR);
-          const ciphertextStr =
-            typeof evt.ciphertext === 'string'
-              ? evt.ciphertext
-              : ethers.hexlify(evt.ciphertext);
-
-          const matched = matchHsrToContact(
-            pendingContacts,
-            evt.inResponseTo as `0x${string}`,
-            responderEphemeralR,
-            ciphertextStr
-          );
-          if (matched && matched.toLowerCase() === from.toLowerCase()) {
-            matchedEvent = evt;
-            break;
-          }
-        }
-
-        if (!matchedEvent) {
-          // Fallback: just use the first HSR from that address
-          matchedEvent = hsrEvents.find(
-            (e: any) => e.responder.toLowerCase() === from.toLowerCase()
-          );
-        }
-
-        if (!matchedEvent) {
+        if (candidateEvents.length === 0) {
           return reply
             .status(404)
             .send({ error: `No handshake response found from ${from}` });
         }
 
-        const responderEphemeralPubKey = ethers.getBytes(
-          matchedEvent.responderEphemeralR
-        );
+        let matchedEvent: any = null;
+        let extractedKeys: {
+          identityPubKey: Uint8Array;
+          signingPubKey: Uint8Array;
+          ephemeralPubKey: Uint8Array;
+          kemCiphertext?: Uint8Array;
+          note?: string;
+        } | null = null;
 
+        for (const evt of candidateEvents) {
+          const ciphertextStr =
+            typeof evt.ciphertext === 'string'
+              ? evt.ciphertext
+              : ethers.hexlify(evt.ciphertext);
+
+          const keys = decryptAndExtractHandshakeKeys(
+            ciphertextStr,
+            pending.ephemeralSecret
+          );
+          if (keys) {
+            matchedEvent = evt;
+            extractedKeys = keys;
+            break;
+          }
+        }
+
+        if (!matchedEvent || !extractedKeys) {
+          return reply
+            .status(404)
+            .send({ error: `Could not decrypt any HSR from ${from}` });
+        }
+
+        // Store the responder's signing key for message decryption
+        saveContactInfo(from, {
+          signingPubKey: extractedKeys.signingPubKey,
+          identityPubKey: extractedKeys.identityPubKey,
+        });
+
+        // Use the REAL ephemeral pubkey and KEM ciphertext from inside the encrypted payload
         const session = verbeth.client.createInitiatorSessionFromHsr({
           contactAddress: from,
           myEphemeralSecret: pending.ephemeralSecret,
           myKemSecret: pending.kemSecret,
           hsrEvent: {
             inResponseToTag: matchedEvent.inResponseTo as `0x${string}`,
-            responderEphemeralPubKey,
-            kemCiphertext: ethers.getBytes(matchedEvent.ciphertext),
+            responderEphemeralPubKey: extractedKeys.ephemeralPubKey,
+            kemCiphertext: extractedKeys.kemCiphertext,
           },
         });
         await verbeth.sessionStore.save(session);
@@ -427,13 +482,20 @@ async function main() {
               fromBlock
             );
 
+            // Get the contact's signing key for signature verification
+            const contact = getContactInfo(session.contactAddress);
+            if (!contact) {
+              // Skip — we don't have this contact's signing key yet
+              continue;
+            }
+
             for (const evt of events) {
               try {
                 const payload = ethers.getBytes(evt.ciphertext);
                 const decrypted = await verbeth.client.decryptMessage(
                   evt.topic,
                   payload,
-                  new Uint8Array(32), // placeholder — real impl needs sender's signing key
+                  contact.signingPubKey,
                   false
                 );
                 if (decrypted) {
