@@ -232,15 +232,14 @@ export async function scanHandshakeResponseEvents(
 
 export async function scanMessageEvents(
   contract: ethers.Contract,
-  senderAddress: string | undefined,
-  topicFilter: string | undefined,
+  topicFilter: string,
   fromBlock: number
 ) {
   const filter = contract.filters.MessageSent(
-    senderAddress ?? null,
     null,
     null,
-    topicFilter ?? null
+    null,
+    topicFilter
   );
   const events = await contract.queryFilter(filter, fromBlock);
   return events.map((e: any) => ({

@@ -257,9 +257,9 @@ async function main() {
           startBlock
         );
 
-        const hsEvent = events.find(
-          (e: any) => e.sender.toLowerCase() === from.toLowerCase()
-        );
+        const hsEvent = events
+          .filter((e: any) => e.sender.toLowerCase() === from.toLowerCase())
+          .pop();
         if (!hsEvent) {
           return reply
             .status(404)
@@ -477,7 +477,6 @@ async function main() {
           for (const topic of topics) {
             const events = await scanMessageEvents(
               verbeth.contract,
-              session.contactAddress,
               topic,
               fromBlock
             );
