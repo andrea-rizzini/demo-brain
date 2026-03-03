@@ -27,6 +27,7 @@ import {
   deletePendingHandshake,
   saveContactInfo,
   getContactInfo,
+  getAllContacts,
   scanHandshakeEvents,
   scanHandshakeResponseEvents,
   scanMessageEvents,
@@ -284,6 +285,9 @@ async function main() {
         );
         const receipt = await result.tx.wait();
 
+        // Remove any stale sessions with this contact before creating the new one
+        const removed = verbeth.sessionStore.deleteByContact(from);
+
         const session = verbeth.client.createResponderSession({
           contactAddress: from,
           responderEphemeralSecret: result.responderEphemeralSecret,
@@ -299,6 +303,7 @@ async function main() {
           txHash: receipt.hash,
           conversationId: session.conversationId,
           contactAddress: from,
+          removedStaleSessions: removed,
         };
       } catch (error: any) {
         return reply
@@ -378,6 +383,9 @@ async function main() {
           signingPubKey: extractedKeys.signingPubKey,
           identityPubKey: extractedKeys.identityPubKey,
         });
+
+        // Remove any stale sessions with this contact before creating the new one
+        verbeth.sessionStore.deleteByContact(from);
 
         // Use the REAL ephemeral pubkey and KEM ciphertext from inside the encrypted payload
         const session = verbeth.client.createInitiatorSessionFromHsr({
@@ -519,6 +527,105 @@ async function main() {
         return reply
           .status(500)
           .send({ error: 'Message scan failed', message: error.message });
+      }
+    }
+  );
+
+  // GET /verbeth/debug — show internal state for troubleshooting
+  server.get('/verbeth/debug', async (_req, reply) => {
+    if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+    const sessions = verbeth.sessionStore.getAll();
+    return {
+      contacts: getAllContacts(),
+      sessions: sessions.map((s) => ({
+        conversationId: s.conversationId,
+        contactAddress: s.contactAddress,
+        hasContactKeys: !!getContactInfo(s.contactAddress),
+        currentTopicInbound: s.currentTopicInbound,
+        receivingMsgNumber: s.receivingMsgNumber,
+        sendingMsgNumber: s.sendingMsgNumber,
+      })),
+    };
+  });
+
+  // POST /verbeth/process — scan incoming messages, generate AI replies, send them back
+  server.post<{ Querystring: { from?: string; fromBlock?: string } }>(
+    '/verbeth/process',
+    async (request, reply) => {
+      if (!verbeth) return reply.status(503).send({ error: 'Verbeth not initialized' });
+
+      const { from, fromBlock: fromBlockStr } = request.query;
+      const fromBlock = fromBlockStr ? Number(fromBlockStr) : getCreationBlock(verbeth.chainId);
+
+      try {
+        const sessions = verbeth.sessionStore.getAll();
+        const relevantSessions = from
+          ? sessions.filter(
+              (s) => s.contactAddress.toLowerCase() === from.toLowerCase()
+            )
+          : sessions;
+
+        const processed: any[] = [];
+
+        for (const session of relevantSessions) {
+          const topics = [
+            session.currentTopicInbound,
+            session.nextTopicInbound,
+            session.previousTopicInbound,
+          ].filter(Boolean) as string[];
+
+          const contact = getContactInfo(session.contactAddress);
+          if (!contact) continue;
+
+          for (const topic of topics) {
+            const events = await scanMessageEvents(
+              verbeth.contract,
+              topic,
+              fromBlock
+            );
+
+            for (const evt of events) {
+              try {
+                const payload = ethers.getBytes(evt.ciphertext);
+                const decrypted = await verbeth.client.decryptMessage(
+                  evt.topic,
+                  payload,
+                  contact.signingPubKey,
+                  false
+                );
+                if (!decrypted) continue;
+
+                // Static reply for testing the pipeline
+                const aiReply = `I received your message: "${decrypted.plaintext}"`;
+
+                // Send encrypted reply back
+                const sendResult = await verbeth.client.sendMessage(
+                  session.conversationId,
+                  aiReply
+                );
+
+                processed.push({
+                  from: evt.sender,
+                  incoming: decrypted.plaintext,
+                  reply: aiReply,
+                  replyTxHash: sendResult.txHash,
+                  conversationId: session.conversationId,
+                });
+              } catch (err: any) {
+                processed.push({
+                  from: evt.sender,
+                  error: err.message || String(err),
+                });
+              }
+            }
+          }
+        }
+
+        return { processed, count: processed.length };
+      } catch (error: any) {
+        return reply
+          .status(500)
+          .send({ error: 'Process failed', message: error.message });
       }
     }
   );

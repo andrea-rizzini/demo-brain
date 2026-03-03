@@ -52,7 +52,7 @@ npm run bob
 **Agent initiates handshake to Bob:**
 
 ```bash
-curl -s -X POST http://localhost:8080/verbeth/handshake/initiate -H "Content-Type: application/json" -d '{"to": "<bob-address>", "message": "Hello Bob!"}'
+curl -s -X POST http://146.148.49.205:8080/verbeth/handshake/initiate -H "Content-Type: application/json" -d '{"to": "0xd093A5885F954586f14cE5D0aeFdAca0b69cD889", "message": "Hello Bob!"}'
 ```
 
 **Bob scans and accepts (in Bob's CLI):**
@@ -65,7 +65,7 @@ bob> accept
 **Agent completes the handshake:**
 
 ```bash
-curl -s -X POST http://localhost:8080/verbeth/handshake/complete -H "Content-Type: application/json" -d '{"from": "<bob-address>"}'
+curl -s -X POST http://146.148.49.205:8080/verbeth/handshake/complete -H "Content-Type: application/json" -d '{"from": "0xd093A5885F954586f14cE5D0aeFdAca0b69cD889"}'
 ```
 
 **Bob sends a message:**
@@ -77,13 +77,13 @@ bob> send Hello from Bob!
 **Agent reads messages:**
 
 ```bash
-curl -s http://localhost:8080/verbeth/messages
+curl -s http://146.148.49.205:8080/verbeth/messages
 ```
 
 **Agent sends a reply:**
 
 ```bash
-curl -s -X POST http://localhost:8080/verbeth/send -H "Content-Type: application/json" -d '{"to": "<bob-address>", "message": "Reply from agent!"}'
+curl -s -X POST http://146.148.49.205:8080/verbeth/send -H "Content-Type: application/json" -d '{"to": "<bob-address>", "message": "Reply from agent!"}'
 ```
 
 **Bob reads the reply:**

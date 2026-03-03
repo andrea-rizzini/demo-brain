@@ -51,6 +51,18 @@ class InMemorySessionStore implements SessionStore {
   getAll(): RatchetSession[] {
     return Array.from(this.sessions.values());
   }
+
+  deleteByContact(contactAddress: string): number {
+    const lower = contactAddress.toLowerCase();
+    let count = 0;
+    for (const [id, session] of this.sessions) {
+      if (session.contactAddress.toLowerCase() === lower) {
+        this.sessions.delete(id);
+        count++;
+      }
+    }
+    return count;
+  }
 }
 
 // --- In-memory PendingStore ---
@@ -105,6 +117,10 @@ export function saveContactInfo(address: string, info: ContactKeys) {
 
 export function getContactInfo(address: string): ContactKeys | undefined {
   return contactInfo.get(address.toLowerCase());
+}
+
+export function getAllContacts(): string[] {
+  return Array.from(contactInfo.keys());
 }
 
 // --- Pending handshake secrets (keyed by lowercase recipient address) ---
